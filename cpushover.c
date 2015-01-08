@@ -34,7 +34,6 @@
 /* Upper bound of chars needed to convert size_t/time_t to char string of its decimal repr. Note: 2^3 < 10 */
 #define SIZSTRBUF (CHAR_BIT * sizeof(size_t))/3 + 2
 #define TIMETSTRBUF (CHAR_BIT * sizeof(time_t))/3 + 2
-#define BOUND(VAR, LOW, HIGH) if (VAR < LOW) { VAR = LOW; } else if (VAR > HIGH) { VAR = HIGH; }
 
 /* Private structs */ 
 typedef struct
@@ -49,7 +48,7 @@ size_t cpsh_write_callback(char*, size_t, size_t, void*);
 
 /* Global vars */
 static char CPSH_API_TOKEN[CPSH_TOKEN_LN+1];
-static char CPSH_API_URL[CPSH_MAX_URL_LN] = "http://api.pushover.net/1/messages.json";
+static char CPSH_API_URL[CPSH_MAX_URL_LN] = "https://api.pushover.net/1/messages.json";
 
 #ifdef CPSH_APPLICATION
 int 
@@ -116,11 +115,6 @@ cpsh_send(cpsh_message *m)
         return CPSH_ERR_INIT;
     }
 
-    /* Check message integrity */
-    /*int msg_string_ok = !npastr(m->user) || !npastr(m->message) || !npastr(m->title) || \
-                        !npastr(m->device) || !npastr(m->url) || !npastr(m->url_title) || 
-                        !npastr(m->sound); */
-
     int msg_string_ok = 1;
     if (!msg_string_ok) 
     {
@@ -136,9 +130,11 @@ cpsh_send(cpsh_message *m)
     }
 
     /* Bound checking */
+#define BOUND(VAR, LOW, HIGH) if (VAR < LOW) { VAR = LOW; } else if (VAR > HIGH) { VAR = HIGH; }
     BOUND(m->priority, -2, 2);
     BOUND(m->retry, 30, 86400);
     BOUND(m->expire, 0, 86400);
+#undef BOUND
 
     /* Connection */
     CURL *curl = curl_easy_init();
