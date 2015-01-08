@@ -7,7 +7,7 @@ HEADERS = $(SOURCES:.c=.h)
 OBJECTS = $(SOURCES:.c=.o)
 EXECUTABLE = cpushover
 
-.PHONY: default clean
+.PHONY: default debug clean
 
 default: $(SOURCES) $(HEADERS) $(EXECUTABLE) 
 
