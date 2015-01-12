@@ -24,14 +24,15 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <limits.h>
-#include <curl/curl.h>
-#include "cJSON.h"
 #include "cpushover.h"
+#include "cJSON.h"
 
-#define CPSH_MAX_URL_LN 128
-#define CPSH_RESP_BUFSIZE 512
+/* Needed for some preprocessor evaluations later on */
+#define EMPTY() 
+#define DEFER(a) a EMPTY()
+#define EVAL(...) __VA_ARGS__
 
-/* Upper bound of chars needed to convert size_t/time_t to char string of its decimal repr. Note: 2^3 < 10 */
+/* Upper bound of chars needed to convert to char string of decimal repr. Note: 2^3 < 10 */
 #define SIZSTRBUF (CHAR_BIT * sizeof(size_t))/3 + 2
 #define TIMETSTRBUF (CHAR_BIT * sizeof(time_t))/3 + 2
 
@@ -42,13 +43,20 @@ typedef struct
     size_t size;
 } cpsh_memory;
 
-/* Private prototypes */
-int npastr(char*, size_t);
-size_t cpsh_write_callback(char*, size_t, size_t, void*);
+typedef struct
+{
+    int initialized;
+    char api_token[CPSH_TOKEN_LN+1];
+    char api_url[CPSH_MAX_API_URL_LN+1];
+} cpsh_config;
 
-/* Global vars */
-static char CPSH_API_TOKEN[CPSH_TOKEN_LN+1];
-static char CPSH_API_URL[CPSH_MAX_URL_LN] = "https://api.pushover.net/1/messages.json";
+/* Private prototypes */
+int pr_ascii_len(char*);
+size_t cpsh_write_callback(char*, size_t, size_t, void*);
+int cpsh_validate_input(cpsh_message*);
+
+/* Global configuration */
+cpsh_config config;
 
 #ifdef CPSH_APPLICATION
 int 
@@ -60,25 +68,22 @@ main(int argc, char *argv[])
 
 
 /* 
- * Checks if *s is printable-ascii-character zero-terminated string.
+   Checks if *s is printable-ascii-character string. 
+   Return values: -1 if string contains non-printable ascii char, 0 if s is NULL, 
+   string length otherwise
  */
 int 
-npastr(char *s, size_t len)
+pr_ascii_len(char *s)
 {
-    for (; len > 0 && *s != '\0'; len--, s++)
+    if (s == NULL) return 0;
+
+    int len;
+    for (len = 0; *s != '\0'; len++, s++)
     {
-        if (!isprint(*s)) 
-        {
-            return CPSH_ERR_ASCII;
-        }
+        if (!isprint(*s)) return -1;
     }
 
-    if (*s != '\0')
-    {
-        return CPSH_ERR_NONTERM;
-    }
-
-    else return 0;
+    return len;
 }
 
 /*
@@ -87,18 +92,10 @@ npastr(char *s, size_t len)
 int
 cpsh_init(char* token)
 {
-    if (npastr(token, CPSH_TOKEN_LN))
-    {
-        return CPSH_ERR_ASCII;
-    } 
-    else if (strlen(token) != CPSH_TOKEN_LN)
-    { 
-        return CPSH_ERR_STRLEN;
-    }
-
-    strncpy(CPSH_API_TOKEN, token, CPSH_TOKEN_LN);
-    CPSH_API_TOKEN[CPSH_TOKEN_LN] = '\0';
-    
+    if (pr_ascii_len(token) != CPSH_TOKEN_LN) return CPSH_ERR_INIT;
+    strcpy(config.api_token, token);
+    strcpy(config.api_url, CPSH_DEFAULT_API_URL);
+    config.initialized = 1;
     return 0;
 }
 
@@ -110,31 +107,17 @@ int
 cpsh_send(cpsh_message *m)
 {
     /* Make sure library has been initialized */
-    if (CPSH_API_TOKEN[0] == '\0')
+    if (!config.initialized)
     {
         return CPSH_ERR_INIT;
     }
 
-    int msg_string_ok = 1;
-    if (!msg_string_ok) 
+    /* Validate input */
+    int input_valid;
+    if ((input_valid = cpsh_validate_input(m)))
     {
-        return CPSH_ERR_MSG_FORMAT;
-    } 
-    else if (m->user[0] == '\0')
-    {
-        return CPSH_ERR_BLANK_USR;
-    } 
-    else if (m->message[0] == '\0')
-    {
-        return CPSH_ERR_BLANK_MSG;
+        return input_valid;
     }
-
-    /* Bound checking */
-#define BOUND(VAR, LOW, HIGH) if (VAR < LOW) { VAR = LOW; } else if (VAR > HIGH) { VAR = HIGH; }
-    BOUND(m->priority, -2, 2);
-    BOUND(m->retry, 30, 86400);
-    BOUND(m->expire, 0, 86400);
-#undef BOUND
 
     /* Connection */
     CURL *curl = curl_easy_init();
@@ -146,32 +129,39 @@ cpsh_send(cpsh_message *m)
     /* Set up the message */
     struct curl_httppost *post = NULL;
     struct curl_httppost *last = NULL;
-    curl_formadd(&post, &last, CURLFORM_COPYNAME, "token", CURLFORM_COPYCONTENTS, CPSH_API_TOKEN, CURLFORM_END);
+    curl_formadd(&post, &last, CURLFORM_COPYNAME, "token", CURLFORM_COPYCONTENTS, \
+            config.api_token, CURLFORM_END);
 
     /* Generate HTTPS POST fields from structure in header file */
-/* Send conditions (dep) */
-#define NODEP 1
-#define NEMPT(a) (m-> a != NULL) && (m-> a [0] != '\0')
-#define FIELDEQ(a, b) m-> a == b
-#define NZERO(a) m-> a != 0 
-#define BOUND(a, b, c) (m-> a >= b) && (m-> a <= c)
 
-/* Add fields */
-#define GENERATE_CURLFORM(type, name, req, pre, dep) if (dep) { GENERATE_CURLFORM_ ## type(name) } 
-#define GENERATE_CURLFORM_CHARPT(name) \
-    curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, m-> name, CURLFORM_END);
-#define GENERATE_CURLFORM_TIMET(name) \
-    char name ## buf [TIMETSTRBUF]; \
-    snprintf(name ## buf, sizeof(name ## buf), "%li", (long) m-> name); \
-    curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, name ## buf, CURLFORM_END); 
-#define GENERATE_CURLFORM_SIZET(name) \
-    char name ## buf [SIZSTRBUF]; \
-    snprintf(name ## buf, sizeof(name ## buf), "%li", (long) m-> name); \
-    curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, name ## buf, CURLFORM_END); 
-#define GENERATE_CURLFORM_SIGNCHAR(name) \
-    char name ## buf [SIZSTRBUF]; \
-    snprintf(name ## buf, sizeof(name ## buf), "%li", (long) m-> name); \
-    curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, name ## buf, CURLFORM_END); 
+    /* Dependencies */
+    #define DEP_NODEP 1
+    #define DEP_NEMPTY(field) (m-> field != NULL) && (m-> field [0] != '\0')
+    #define DEP_NZERO(field) m-> field != 0
+    #define DEP_FIELDEQ(field, val) m-> field == val
+
+    /* Add fields */
+    #define GENERATE_CURLFORM(type, name, check, dep) if (DEP_ ## dep) \
+        { GENERATE_CURLFORM_ ## type(name) } 
+    #define GENERATE_CURLFORM_CHARPT(name) \
+        if ((m-> name != NULL) && (m-> name [0] != '\0')) \
+            curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, \
+                    m-> name, CURLFORM_END);
+    #define GENERATE_CURLFORM_TIMET(name) \
+        char name ## buf [TIMETSTRBUF]; \
+        snprintf(name ## buf, sizeof(name ## buf), "%li", (long) m-> name); \
+        curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, \
+                name ## buf, CURLFORM_END); 
+    #define GENERATE_CURLFORM_SIZET(name) \
+        char name ## buf [SIZSTRBUF]; \
+        snprintf(name ## buf, sizeof(name ## buf), "%li", (long) m-> name); \
+        curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, \
+                name ## buf, CURLFORM_END); 
+    #define GENERATE_CURLFORM_SIGNCHAR(name) \
+        char name ## buf [SIZSTRBUF]; \
+        snprintf(name ## buf, sizeof(name ## buf), "%li", (long) m-> name); \
+        curl_formadd(&post, &last, CURLFORM_COPYNAME, #name, CURLFORM_COPYCONTENTS, \
+                name ## buf, CURLFORM_END); 
 
     CPSH_API_FIELDS(GENERATE_CURLFORM)
 
@@ -180,7 +170,7 @@ cpsh_send(cpsh_message *m)
     memset(&push_response, 0, sizeof(push_response));
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&push_response);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &cpsh_write_callback);
-    curl_easy_setopt(curl, CURLOPT_URL, CPSH_API_URL);
+    curl_easy_setopt(curl, CURLOPT_URL, config.api_url);
     curl_easy_setopt(curl, CURLOPT_HTTPPOST, post);
 
     /* Perform HTTPS POST */
@@ -209,6 +199,26 @@ cpsh_send(cpsh_message *m)
     {
         return 0;
     }
+}
+
+int
+cpsh_validate_input(cpsh_message *m)
+{
+    
+    #define FLAT_STLEN(a, b) STLEN, a, b
+    #define FLAT_NODEP NODEP, N/A, N/A 
+    #define FLAT_BOUND(a, b) BOUND, a, b 
+    #define FLAT_NORBOUND(a, b) NORBOUND, a, b 
+    #define VAL_STLEN(name, a, b) (pr_ascii_len(m-> name) >= a) && (pr_ascii_len(m-> name) <= b)
+    #define VAL_NODEP(name, a, b) 1
+    #define VAL_BOUND(name, a, b) ((m-> name >= a) && (m-> name <= b))
+    #define VAL_NORBOUND(name, a, b) ((m-> name == 0) || (VAL_BOUND(name, a, b)))
+    #define GEN_VAL(name, val, a, b) if (! VAL_ ## val(name, a, b)) { return CPSH_ERR_MSG_FORMAT; } 
+    #define VALIDATE_FIELDS(type, name, check, dep) EVAL(DEFER(GEN_VAL)(name, FLAT_ ## check))
+
+    CPSH_API_FIELDS(VALIDATE_FIELDS)
+    
+    return 0;
 }
 
 size_t 
